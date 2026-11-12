@@ -116,6 +116,40 @@ ASSETS = [
             {"name": "region", "data_type": "varchar(32)", "nullable": True, "description": "大区"},
         ],
     },
+    {
+        "name": "refunds",
+        "schema_name": "ods",
+        "asset_type": "table",
+        "description": "退款原始表（ingest 自退款中心；refund_amount 计划下线，需先评估并集下游影响）",
+        "columns": [
+            {"name": "refund_id", "data_type": "bigint", "nullable": False, "description": "退款单号"},
+            {"name": "user_id", "data_type": "bigint", "nullable": False, "description": "用户 ID"},
+            {"name": "refund_amount", "data_type": "decimal(18,2)", "nullable": False, "description": "退款金额"},
+            {"name": "reason", "data_type": "varchar(128)", "nullable": True, "description": "退款原因"},
+        ],
+    },
+    {
+        "name": "settle_union",
+        "schema_name": "dwd",
+        "asset_type": "view",
+        "description": "月底结算并集视图：订单流与退款流 UNION ALL，按列位对齐",
+        "columns": [
+            {"name": "biz_id", "data_type": "bigint", "nullable": False, "description": "业务单号（订单号/退款单号）"},
+            {"name": "user_id", "data_type": "bigint", "nullable": False, "description": "用户 ID"},
+            {"name": "amt", "data_type": "decimal(18,2)", "nullable": False, "description": "业务金额（订单金额/退款金额）"},
+            {"name": "biz_type", "data_type": "varchar(16)", "nullable": False, "description": "业务类型字面量（order/refund）"},
+        ],
+    },
+    {
+        "name": "settle_report",
+        "schema_name": "ads",
+        "asset_type": "table",
+        "description": "月底结算报表：在订单/退款并集上按用户汇总净额",
+        "columns": [
+            {"name": "user_id", "data_type": "bigint", "nullable": False, "description": "用户 ID"},
+            {"name": "net_amt", "data_type": "decimal(18,2)", "nullable": True, "description": "订单-退款净额汇总"},
+        ],
+    },
 ]
 
 TRANSFORMATIONS = [
@@ -204,6 +238,53 @@ JOIN ods.orders AS o
         "sql": """-- SELECT * 无法完全展开：上游 dwd.order_detail 少登记了 pay_method
 SELECT *
 FROM dwd.order_detail
+""",
+    },
+    {
+        "name": "t07_month_end_settle_union",
+        "owner": "analyst",
+        "inputs": ["ods.orders", "ods.refunds"],
+        "output": "dwd.settle_union",
+        "dialect": "postgres",
+        "sql": """-- 月底结算：订单流与退款流并集，UNION ALL 按列位（非列名）对齐
+SELECT order_id AS biz_id,
+       user_id,
+       amount AS amt,
+       'order' AS biz_type
+FROM ods.orders
+UNION ALL
+SELECT refund_id,
+       user_id,
+       refund_amount,
+       'refund'
+FROM ods.refunds
+""",
+    },
+    {
+        "name": "t08_settle_report_rollup",
+        "owner": "analyst",
+        "inputs": ["dwd.settle_union"],
+        "output": "ads.settle_report",
+        "dialect": "postgres",
+        "sql": """-- 结算报表：在并集视图上按用户汇总净额（穿透 UNION 追踪到订单/退款两条流）
+SELECT s.user_id AS user_id,
+       SUM(s.amt) AS net_amt
+FROM dwd.settle_union AS s
+GROUP BY s.user_id
+""",
+    },
+    {
+        "name": "t09_union_arity_mismatch_partial",
+        "owner": "admin",
+        "inputs": ["ods.orders", "ods.refunds"],
+        "output": "dwd.settle_union",
+        "dialect": "postgres",
+        "sql": """-- 分支列数不一致：退款侧少一个列位，partial 但保留两侧已知来源
+SELECT order_id AS biz_id, user_id, amount AS amt, 'order' AS biz_type
+FROM ods.orders
+UNION ALL
+SELECT refund_id, user_id, refund_amount
+FROM ods.refunds
 """,
     },
 ]

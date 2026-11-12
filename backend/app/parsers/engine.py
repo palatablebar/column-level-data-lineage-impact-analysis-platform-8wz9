@@ -12,6 +12,7 @@ from sqlglot import exp
 from app.parsers.context import AssetInfo, ParseContext
 from app.parsers.projection import ProjectionBuilder, classify_expr
 from app.parsers.scope import Ref, Scope, SourceEntry
+from app.parsers.setops import describe_setop, process_setop
 from app.parsers.star import expand_star  # noqa: F401  （star 由 projection 调用，此处保留导出）
 
 
@@ -26,6 +27,8 @@ class ParseResult:
     error_column: int | None = None
     star_expanded: bool = False
     edge_count: int = 0
+    # UNION / EXCEPT / INTERSECT 的逐分支列位对齐说明（非集合运算时为 None）
+    set_ops: dict | None = None
 
     def to_report(self) -> dict:
         return {
@@ -37,6 +40,7 @@ class ParseResult:
             "error_line": self.error_line,
             "error_column": self.error_column,
             "edge_count": self.edge_count,
+            "set_ops": self.set_ops,
             "columns": [
                 {"target_column": target, "sources": [f"{r.asset_id}:{r.column}" for r in refs]}
                 for target, refs in self.columns.items()
@@ -56,8 +60,25 @@ def extract_select(stmt: exp.Expression | None) -> exp.Select | None:
         return extract_select(stmt.expression)
     if isinstance(stmt, exp.Insert):
         return extract_select(stmt.expression)
-    if isinstance(stmt, exp.Union):
+    if isinstance(stmt, exp.SetOperation):
         return None
+    return None
+
+
+def extract_query(stmt: exp.Expression | None) -> exp.Expression | None:
+    """取语句主体：SELECT 或集合运算（UNION / EXCEPT / INTERSECT）。
+
+    支持顶层 SELECT、INSERT ... SELECT、CREATE ... AS SELECT，以及括号包裹的
+    集合运算分支（``(SELECT ...) UNION ALL (SELECT ...)``）。
+    """
+    if stmt is None:
+        return None
+    if isinstance(stmt, (exp.Select, exp.SetOperation)):
+        return stmt
+    if isinstance(stmt, exp.Subquery):
+        return extract_query(stmt.this)
+    if isinstance(stmt, (exp.Create, exp.Insert)):
+        return extract_query(stmt.expression)
     return None
 
 
@@ -82,20 +103,27 @@ def parse_sql(
     except Exception as exc:  # pragma: no cover - 非预期异常
         return ParseResult(status="failed", parse_error=f"{type(exc).__name__}: {exc}")
 
-    select = None
+    query = None
     for stmt in statements or []:
-        candidate = extract_select(stmt)
+        candidate = extract_query(stmt)
         if candidate is not None:
-            select = candidate
+            query = candidate
 
-    if select is None:
+    if query is None:
         return ParseResult(
             status="failed",
-            parse_error="未在 SQL 中找到可解析的 SELECT 语句（支持 SELECT / INSERT ... SELECT / CREATE ... AS SELECT）",
+            parse_error="未在 SQL 中找到可解析的 SELECT 语句（支持 SELECT / INSERT ... SELECT / CREATE ... AS SELECT / UNION）",
         )
 
     try:
-        columns = process_select(select, Scope(), ctx)
+        if isinstance(query, exp.SetOperation):
+            # WITH 注册在 process_setop 内部完成（嵌套集合运算复用同一入口）
+            setop_result = process_setop(query, Scope(), ctx)
+            columns = setop_result.columns
+            set_ops = describe_setop(setop_result)
+        else:
+            columns = process_select(query, Scope(), ctx)
+            set_ops = None
     except sqlglot.errors.ParseError as exc:
         line, column = _error_position(exc)
         return ParseResult(
@@ -116,6 +144,7 @@ def parse_sql(
         unresolved=[issue.to_dict() for issue in ctx.unresolved],
         star_expanded=ctx.star_expanded,
         edge_count=edge_count,
+        set_ops=set_ops,
     )
 
 
@@ -131,45 +160,73 @@ def _error_position(exc: sqlglot.errors.ParseError) -> tuple[int | None, int | N
     return None, None
 
 
-def process_select(select: exp.Select, outer_scope: Scope, ctx: ParseContext) -> dict[str, list[Ref]]:
-    """处理一个 SELECT：先注册 CTE/子查询作用域，再展开投影。"""
-    if isinstance(select, exp.Union):
-        ctx.mark_partial(
-            "union_not_supported",
-            detail="UNION / EXCEPT / INTERSECT 暂未做列级展开",
-            warning="UNION 语句暂未做列级展开，结果记为 partial",
-        )
-        select = select.this if isinstance(select.this, exp.Select) else None
-        if select is None:
-            return {}
+def _resolve_query_columns(
+    node: exp.Expression, outer_scope: Scope, ctx: ParseContext
+) -> dict[str, list[Ref]]:
+    """把 WITH 里的查询体（SELECT 或集合运算）解析成列 → refs。"""
+    if isinstance(node, exp.SetOperation):
+        return process_setop(node, outer_scope, ctx).columns
+    return process_select(node, outer_scope, ctx)
 
+
+def _register_with_clause(
+    with_clause: exp.Expression, outer_scope: Scope, ctx: ParseContext
+) -> Scope:
+    """把一个 WITH 子句的 CTE 按顺序注册成新的一层作用域并返回。
+
+    后一个 CTE 可以引用前面的 CTE；CTE 自身也允许是集合运算。
+    """
     cte_scope = Scope(parent=outer_scope)
-    builder = ProjectionBuilder(ctx)
-
-    # 1) CTE：按顺序注册到 cte_scope，后一个 CTE 可以引用前面的 CTE
-    with_clause = select.args.get("with")
-    if with_clause is not None:
-        for cte in with_clause.expressions:
-            if not isinstance(cte, exp.CTE):
-                continue
-            inner = extract_select(cte.this)
-            if inner is None:
-                ctx.mark_partial(
-                    "cte_not_select",
-                    detail=f"CTE {cte.alias} 不是 SELECT",
-                    warning=f"CTE {cte.alias} 不是 SELECT，跳过",
-                )
-                continue
-            inner_columns = process_select(inner, cte_scope, ctx)
-            entry = SourceEntry(
+    for cte in with_clause.expressions:
+        if not isinstance(cte, exp.CTE):
+            continue
+        inner = extract_query(cte.this)
+        if inner is None:
+            ctx.mark_partial(
+                "cte_not_select",
+                detail=f"CTE {cte.alias} 不是 SELECT",
+                warning=f"CTE {cte.alias} 不是 SELECT，跳过",
+            )
+            continue
+        inner_columns = _resolve_query_columns(inner, cte_scope, ctx)
+        cte_scope.register(
+            [cte.alias],
+            SourceEntry(
                 label=cte.alias,
                 asset_id=None,
                 columns=list(inner_columns.keys()),
                 lineage=inner_columns,
                 complete=True,
                 derived=True,
-            )
-            cte_scope.register([cte.alias], entry)
+            ),
+        )
+    return cte_scope
+
+
+def _register_ctes(select: exp.Select, outer_scope: Scope, ctx: ParseContext) -> Scope:
+    """把 SELECT 上的 WITH 子句注册成新的一层作用域并返回。"""
+    with_clause = select.args.get("with")
+    if with_clause is None:
+        return Scope(parent=outer_scope)
+    return _register_with_clause(with_clause, outer_scope, ctx)
+
+
+def _register_union_ctes(union: exp.SetOperation, outer_scope: Scope, ctx: ParseContext) -> Scope:
+    """集合运算顶层的 WITH（``WITH x AS (...) SELECT ... UNION ALL ...``）。
+
+    sqlglot 会把 WITH 挂在集合运算节点上而非左分支，需要在进入分支前统一注册，
+    使每个分支都能在父作用域里查到这些 CTE。
+    """
+    with_clause = union.args.get("with")
+    if with_clause is None:
+        return outer_scope
+    return _register_with_clause(with_clause, outer_scope, ctx)
+
+
+def process_select(select: exp.Select, outer_scope: Scope, ctx: ParseContext) -> dict[str, list[Ref]]:
+    """处理一个 SELECT：先注册 CTE/子查询作用域，再展开投影。"""
+    cte_scope = _register_ctes(select, outer_scope, ctx)
+    builder = ProjectionBuilder(ctx)
 
     # 2) FROM / JOIN 注册到本层作用域（避免与 CTE 名混淆）
     scope = Scope(parent=cte_scope)
@@ -260,7 +317,7 @@ def _register_source(source: exp.Expression, scope: Scope, ctx: ParseContext) ->
         return entry
 
     if isinstance(source, exp.Subquery):
-        inner = extract_select(source.this)
+        inner = extract_query(source.this)
         if inner is None:
             ctx.mark_partial(
                 "subquery_not_select",
@@ -268,7 +325,7 @@ def _register_source(source: exp.Expression, scope: Scope, ctx: ParseContext) ->
                 warning="派生表不是 SELECT，跳过",
             )
             return None
-        inner_columns = process_select(inner, scope, ctx)
+        inner_columns = _resolve_query_columns(inner, scope, ctx)
         alias = source.alias or "subquery"
         return SourceEntry(
             label=alias,

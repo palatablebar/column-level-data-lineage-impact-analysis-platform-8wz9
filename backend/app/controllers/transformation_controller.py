@@ -43,4 +43,5 @@ def preview_payload(db: Session, *, sql_text: str, dialect: str, output_asset_id
             for target, refs in result.columns.items()
         ],
         "report": {"edge_count": result.edge_count, "star_expanded": result.star_expanded},
+        "set_ops": result.set_ops,
     }

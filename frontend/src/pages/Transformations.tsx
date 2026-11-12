@@ -6,6 +6,7 @@ import { ColumnTag } from '../components/common/ColumnTag';
 import { EmptyState } from '../components/common/EmptyState';
 import { ErrorPanel } from '../components/common/ErrorPanel';
 import { SqlEditor } from '../components/common/SqlEditor';
+import { SetOpsPanel, type SetOpsReport } from '../components/common/SetOpsPanel';
 import { AppShell } from '../components/layout/AppShell';
 import { EDGE_KIND_LABELS, type EdgeKind } from '../constants/edgeKind';
 import { MSG_PARSE_FAILED_ADVICE, MSG_PARTIAL_HINT } from '../constants/messages';
@@ -265,6 +266,22 @@ export function TransformationsPage() {
                     <div className="small muted" style={{ marginTop: 10 }}>
                       解析器：{report.parser} · 方言 {report.dialect} · {report.star_expanded ? '含 SELECT * 展开' : '无星号展开'}
                     </div>
+                  )}
+                  {report.set_ops && (
+                    <SetOpsPanel
+                      setOps={report.set_ops as SetOpsReport}
+                      assetNames={Object.fromEntries(assets.map((a) => [a.id, a.display_name]))}
+                    />
+                  )}
+                  {preview?.set_ops && (
+                    <>
+                      <hr className="section-rule" />
+                      <div className="eyebrow">试解析预览 · 集合运算列位对齐（未落库）</div>
+                      <SetOpsPanel
+                        setOps={preview.set_ops as SetOpsReport}
+                        assetNames={Object.fromEntries(assets.map((a) => [a.id, a.display_name]))}
+                      />
+                    </>
                   )}
                 </div>
               </div>

@@ -70,6 +70,7 @@ def _build_report(
         "warnings": result.warnings,
         "star_expanded": result.star_expanded,
         "edge_count": result.edge_count,
+        "set_ops": result.set_ops,
         "input_assets": [{"id": a.id, "name": a.display_name} for a in input_assets],
         "output_asset": {"id": output_asset.id, "name": output_asset.display_name},
         "columns": columns,
@@ -196,6 +197,15 @@ def parse_transformation(db: Session, transformation: Transformation) -> Transfo
                     asset=issue.get("asset_name"),
                     column="*",
                     missing=",".join(issue.get("missing") or []) or "unknown",
+                )
+            if issue.get("reason") in ("union_arity_mismatch", "union_branch_unconfirmed"):
+                log(
+                    logger,
+                    "PARSE_PARTIAL_SETOP",
+                    level=logging.WARNING,
+                    transformation=transformation.name,
+                    column=issue.get("column") or "(branch)",
+                    branches=",".join(issue.get("missing") or []) or "unconfirmed",
                 )
         log(
             logger,

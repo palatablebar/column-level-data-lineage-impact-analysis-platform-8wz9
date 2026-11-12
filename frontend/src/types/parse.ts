@@ -7,4 +7,5 @@ export interface ParsePreview {
   unresolved: { reason: string; column?: string; missing?: string[]; detail?: string }[];
   columns: { target_column: string; sources: { asset_id: string; column: string; edge_kind: string }[] }[];
   report: { edge_count: number; star_expanded?: boolean };
+  set_ops?: import('../components/common/SetOpsPanel').SetOpsReport | null;
 }

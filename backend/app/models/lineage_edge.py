@@ -13,8 +13,14 @@ from app.config.database import Base
 class LineageEdge(Base):
     __tablename__ = "lineage_edges"
     __table_args__ = (
+        # 去重粒度包含 source_asset_id：集合运算（UNION/EXCEPT/INTERSECT）按列位
+        # 对齐后，同一 target_column 可能来自多个输入资产的同名/异名列，属于不同边。
         UniqueConstraint(
-            "transformation_id", "source_column", "target_column", name="uq_edge_transform_columns"
+            "transformation_id",
+            "source_asset_id",
+            "source_column",
+            "target_column",
+            name="uq_edge_transform_columns",
         ),
     )
 

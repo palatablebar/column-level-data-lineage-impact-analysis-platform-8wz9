@@ -4,6 +4,7 @@ PARSE_START = "PARSE_START transformation={transformation} dialect={dialect} sql
 PARSE_OK = "PARSE_OK transformation={transformation} edges={edges} status={status}"
 PARSE_PARTIAL = "PARSE_PARTIAL transformation={transformation} reason={reason}"
 PARSE_PARTIAL_STAR = "PARSE_PARTIAL_STAR asset={asset} column={column} missing={missing}"
+PARSE_PARTIAL_SETOP = "PARSE_PARTIAL_SETOP transformation={transformation} column={column} missing_branches={branches}"
 PARSE_FAILED_WITH_POS = "PARSE_FAILED_WITH_POS transformation={transformation} message={message} line={line} col={col}"
 PARSE_TIMEOUT = "PARSE_TIMEOUT transformation={transformation} elapsed_ms={elapsed}"
 PARSE_QUOTA_REJECT = "PARSE_QUOTA_REJECT user={user} used={used} max={max}"

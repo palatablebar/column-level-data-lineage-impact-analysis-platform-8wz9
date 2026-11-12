@@ -36,17 +36,23 @@ docker compose exec backend python -m scripts.seed_demo
 执行后应得到：
 
 - **3 个账号**：admin / analyst / viewer（见上表）
-- **5 个资产**（4 张业务表 + 1 个 `cte_result` 资产，按 `lanzo_dw.<schema>.<name>` 登记）：
+- **8 个资产**（7 张业务表/视图 + 1 个 `cte_result` 资产，按 `lanzo_dw.<schema>.<name>` 登记）：
   - `ods.orders`（5 列）
+  - `ods.refunds`（4 列，退款流；演示 `refund_amount` 下线影响分析）
   - `dwd.order_detail`（4 列；**故意少登记 `pay_method`**，这是 `SELECT *` 判成 `partial` 的坑）
   - `dws.user_gmv`（3 列）
   - `ads.gmv_daily`（5 列）
+  - `dwd.settle_union`（4 列，`view`：订单流/退款流 `UNION ALL` 并集视图）
+  - `ads.settle_report`（2 列：在并集上聚合的月底结算报表）
   - `dwd.cte_result`（`asset_type=cte_result`，计入影响面但不进迁移清单）
-- **6 段 SQL**：5 段 `parsed` + 1 段 `partial`（`t06_star_partial_from_order_detail`，`SELECT * FROM dwd.order_detail`）
+- **9 段 SQL**：7 段 `parsed` + 2 段 `partial`
+  - `t06_star_partial_from_order_detail`（`SELECT * FROM dwd.order_detail`，星号无法完全展开）
+  - `t09_union_arity_mismatch_partial`（并集分支列数不一致，保留已知来源并标缺口）
 - **1 次历史 `SchemaChangeEvent`**：`dwd.order_detail.pay_amount`，`decimal(18,2)` → `string`，`source=manual`
 - **1 条历史 `ImpactAnalysis`**：目标 `dwd.order_detail.pay_amount`、`change_type=change_type`、`severity=high`、`affected_count=5`
 
 主链 `ods.orders → dwd.order_detail → dws.user_gmv → ads.gmv_daily` 由 seed 触发真实解析产出（脚本内**不手写任何边**）。
+并集链 `ods.orders / ods.refunds → dwd.settle_union → ads.settle_report`（t07/t08）同样由真实解析产出，可在 `/impact` 对 `ods.refunds.refund_amount` 发起 `drop_column` 分析验证穿透效果。
 
 ---
 
@@ -57,7 +63,7 @@ docker compose exec backend python -m scripts.seed_demo
 现在的流程：
 
 1. 平台管理员在 `/assets` 登记 `ods.orders`、`dwd.order_detail`（`pay_amount` = `decimal(18,2)`）、`dws.user_gmv`、`ads.gmv_daily`，`dwd.order_detail` 故意少登记 1 列（`pay_method`）；
-2. 在 `/transformations` 录入 6 段 SQL（CTE / 子查询 / 多输入 JOIN / `SUM` 聚合 / `CAST` 表达式 / `SELECT *`），解析后 5 段 `parsed`、1 段 `partial`；
+2. 在 `/transformations` 录入 9 段 SQL（CTE / 子查询 / 多输入 JOIN / `SUM` 聚合 / `CAST` 表达式 / `SELECT *` / `UNION ALL` 并集），解析后 7 段 `parsed`、2 段 `partial`；
 3. 数据开发要把 `dwd.order_detail.pay_amount` 改成 `string`，先在 `/impact` 发起分析：报告给出 **`high`、3 个资产 / 5 个列 / 2 张报表**，迁移清单分 `add_cast` / `rewrite_sql` 两类，每条带 `suggested_sql`；
 4. 导出 `report_json.migration_checklist` 发给报表 owner；owner 用 `viewer` 账号只读确认（发起分析会被 403 拒绝）；
 5. 出问题时可回 `/assets/:id` 看 `pay_amount` 的结构变更时间线，或到 `/lineage` 从 `ads.gmv_daily` 往上游走 3 步抽查列级链。
@@ -112,12 +118,13 @@ gb-546/
 │   │   ├── services/           # asset / transformation / parse / lineage / impact / cycle / quota / audit /
 │   │   │                       # permission / schema_change
 │   │   ├── middlewares/        # auth / rbac / audit_logger / parse_guard / error_handler
-│   │   ├── parsers/            # context / scope / projection / star / graph / engine（列级解析引擎）
+│   │   ├── parsers/            # context / scope / projection / star / setops / graph / engine（列级解析引擎）
 │   │   ├── utils/              # jwt / password / logger / formatters / pagination / hashing / errors
 │   │   ├── constants/          # asset / lineage / parse / impact / change / edge / roles / error_codes /
-│   │   │                       # log_templates（38 条模板）/ messages / limits
-│   │   ├── alembic/            # env.py + versions/0001_initial.py
-│   │   └── scripts/            # seed_demo.py（幂等）/ wait_for_db.py
+│   │   │                       # log_templates（37 条模板）/ messages / limits
+│   │   ├── alembic/            # env.py + versions/0001_initial.py / 0002_edge_unique_with_asset.py
+│   │   ├── scripts/            # seed_demo.py（幂等）/ wait_for_db.py
+│   │   └── tests/              # test_setops / test_regression / test_seed_scenarios / test_integration_union
 │   └── scripts/                # 容器内可执行：python -m scripts.seed_demo
 ├── worker/                     # 独立容器（复用 backend 镜像，PYTHONPATH=/app/backend:/app）
 │   ├── celery_app.py           # 队列 lineage/impact、soft/hard time limit、重试
@@ -141,7 +148,7 @@ gb-546/
         └── styles/             # tokens.css（oklch 深墨蓝/黄铜/羊皮纸）+ global.css
 ```
 
-`worker/parsers/` 每个文件职责一句话：`context.py` 解析上下文（输入资产列清单、方言、告警与 partial 收集）；`scope.py` 作用域栈（CTE / 子查询 / 派生表注册与查找）；`projection.py` 投影表达式 → 列级边（聚合/派生分类）；`star.py` `SELECT *` 展开与 partial 判定；`graph.py` 有向图构建、Tarjan 环检测、可达性 BFS。它们统一 `from app.parsers.X import *`，保证 backend 同步解析与 worker 异步解析走**同一份**实现。
+`worker/parsers/` 每个文件职责一句话：`context.py` 解析上下文（输入资产列清单、方言、告警与 partial 收集）；`scope.py` 作用域栈（CTE / 子查询 / 派生表注册与查找）；`projection.py` 投影表达式 → 列级边（聚合/派生分类）；`star.py` `SELECT *` 展开与 partial 判定；`setops.py` 集合运算分支压平与按列位对齐；`graph.py` 有向图构建、Tarjan 环检测、可达性 BFS。它们统一 `from app.parsers.X import *`，保证 backend 同步解析与 worker 异步解析走**同一份**实现。
 
 ---
 
@@ -190,9 +197,12 @@ gb-546/
 | 表达式 | `CAST / CONCAT / CASE / 算术` | `parsed` | `derived`，`expression_text` 存原始片段（≤512 字符） |
 | 无法解析 | `SELECT * FORM x` | **`failed`** | 无边；`parse_error` 保留 sqlglot 原文 + `line/col` |
 | 裸列多候选 | JOIN 两侧同名列 | `partial` | 取最内层作用域并记 warning |
+| 集合运算等宽 | `SELECT ... FROM t1 UNION ALL SELECT ... FROM t2` | `parsed` | **按列位（非列名）对齐**，每个结果列汇聚各分支同列位的来源；结果列名取最左分支；`report_json.set_ops` 逐分支记录运算符与来源覆盖 |
+| 集合运算分支缺列 | 两侧投影列数不一致 | **`partial`** | 已知分支来源照常落边，缺口列位记 `union_arity_mismatch`（标明缺哪些分支），`set_ops.missing_positions` 同步标注 |
+| 集合运算分支失联 | 分支表不在输入资产清单 | **`partial`** | 保留其余分支的已知来源，失联分支记 `union_branch_unconfirmed` + `unknown_input_asset`，不把不完整结果当完整清单 |
 
-> 说明：`UNION` / `EXCEPT` / `INTERSECT` 暂未做列级展开，会显式标 `partial` 而不是假装解析成功。
-> 同一条 `(transformation, source_column, target_column)` 只保留一条边（数据库唯一约束），因此 `join_key` 作为更具体的类型**替代**同对的 `direct`，不新增第二条边。
+> 集合运算（`UNION` / `UNION ALL` / `EXCEPT` / `INTERSECT`）遵循 SQL 标准的**列位对齐**语义：`parsers/setops.py` 把集合树压平为有序分支列表，逐列位取来源并集；支持括号分支、顶层 `WITH`、CTE/派生表内嵌集合运算以及 `INSERT ... SELECT ... UNION`。分支内部的聚合/派生/星号展开仍复用既有解析逻辑，分支自身的 partial 标记照常保留。
+> 同一条 `(transformation, source_asset_id, source_column, target_column)` 只保留一条边（数据库唯一约束，迁移 `0002` 起纳入 `source_asset_id` 以区分并集两侧同名来源列），因此 `join_key` 作为更具体的类型**替代**同对的 `direct`，不新增第二条边。
 
 ---
 
@@ -259,6 +269,18 @@ gb-546/
 - 前端：`constants/assetStatus.ts`、`types/dataAsset.ts`、`components/common/AssetBadge.tsx`（角标）、`pages/Assets.tsx`（筛选）
 
 ---
+
+## 测试
+
+不依赖 pytest，全部为可直接运行的模块（容器/虚拟环境内已含 sqlglot、SQLAlchemy）：
+
+```bash
+cd backend
+PYTHONPATH=$PWD python3 -m tests.test_setops             # 集合运算列位对齐 11 组场景
+PYTHONPATH=$PWD python3 -m tests.test_regression         # 原有 6 段 SQL 解析结果不回归
+PYTHONPATH=$PWD python3 -m tests.test_seed_scenarios     # seed 9 段 SQL 状态分布与并集链
+PYTHONPATH=$PWD python3 -m tests.test_integration_union  # SQLite 内存库：落边 + 影响分析穿透 UNION
+```
 
 ## 本地开发（不使用 Docker）
 
